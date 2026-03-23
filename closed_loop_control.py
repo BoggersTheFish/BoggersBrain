@@ -8,6 +8,7 @@ No neural networks, no gradients, no external ML libraries.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import random
@@ -16,6 +17,23 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except ImportError:  # pragma: no cover
+    tk = None  # type: ignore[assignment]
+    messagebox = None  # type: ignore[assignment]
+
+try:
+    from PIL import ImageGrab
+except ImportError:  # pragma: no cover
+    ImageGrab = None  # type: ignore[assignment]
+
+try:
+    import pyautogui
+except ImportError:  # pragma: no cover
+    pyautogui = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -70,6 +88,14 @@ EMERGENT_GATE_MEAN_RATIO = 0.95
 EMERGENT_GATE_VAR_RATIO = 0.9
 # If set to 1/y/yes: allow small regression vs baseline (exploration) — see maybe_invent_goal().
 EMERGENT_RELAX_GATE_ENV = "EMERGENT_RELAX_GATE"
+HIERARCHICAL_INTERVAL = 300
+REFLECTION_WINDOW = 100
+HIERARCHICAL_SANDBOX_STEPS = 30
+EMBODIMENT_INTERVAL = 100
+VISION_SYMBOL_INTERVAL = 150
+VISION_CAPTURE_INTERVAL = 50
+FEATURE_PROPOSAL_INTERVAL = 500
+FEATURE_SANDBOX_STEPS = 40
 # Spawn a shadow graph for parallel internal-wave scoring (no invalid extra node ids).
 DISTRIBUTED_SPAWN_DIFF = (
     "self.distributed_graphs.append(spawn_child_graph(self)); "
@@ -77,6 +103,40 @@ DISTRIBUTED_SPAWN_DIFF = (
 )
 
 VIBE_AUDIT_LOG = Path(__file__).resolve().parent / "vibe_code_audit.log"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "brain_checkpoint.json"
+CHECKPOINT_VERSION = 1
+
+
+def checkpoint_enabled() -> bool:
+    """Set BRAIN_CHECKPOINT=0 to disable load/save (default: enabled)."""
+    return os.environ.get("BRAIN_CHECKPOINT", "1").strip().lower() not in ("0", "n", "no", "false")
+
+
+def embodiment_enabled() -> bool:
+    """Set BRAIN_EMBODIMENT=y to allow gated desktop actions (default: off)."""
+    v = os.environ.get("BRAIN_EMBODIMENT", "").strip().lower()
+    return v in ("1", "y", "yes")
+
+
+def embodiment_deps_available() -> bool:
+    return (
+        tk is not None
+        and messagebox is not None
+        and ImageGrab is not None
+        and pyautogui is not None
+    )
+
+
+def vision_symbols_enabled() -> bool:
+    """Set BRAIN_VISION_SYMBOLS=0 to disable vision symbols (default: enabled)."""
+    v = os.environ.get("BRAIN_VISION_SYMBOLS", "y").strip().lower()
+    return v not in ("0", "n", "no", "false")
+
+
+def self_feature_enabled() -> bool:
+    """Set BRAIN_SELF_FEATURE=y to enable sandboxed self-feature proposals (default: off)."""
+    v = os.environ.get("BRAIN_SELF_FEATURE", "").strip().lower()
+    return v in ("1", "y", "yes")
 
 
 def code_emission_gate_and_scales() -> Tuple[float, float, float, float, float]:
@@ -812,6 +872,14 @@ class ControlSystem:
         self.code_emit_rollbacks = 0
         self.emergent_goal_commits = 0
         self.emergent_goal_rollbacks = 0
+        self.hierarchical_plan_commits = 0
+        self.hierarchical_plan_rollbacks = 0
+        self.embodiment_commits = 0
+        self.embodiment_rollbacks = 0
+        self.vision_history: List[float] = []
+        self.vision_symbols_formed = 0
+        self.self_feature_commits = 0
+        self.self_feature_rollbacks = 0
         # Phase 5: real sensor callables (wall clock + external file); blend in sense_real_world.
         self.real_sensors: Tuple[Callable[[], List[float]], ...] = (
             read_timestamp_sensor_vec,
@@ -1201,6 +1269,602 @@ class ControlSystem:
             if not self.quiet:
                 print("EMERGENT GOAL: veto or declined")
 
+    def reflect_on_recent_waves(self) -> str:
+        """Summarize recent real-wave tension and symbol usage (no side effects)."""
+        g = self.graph
+        h = g.tension_history
+        if len(h) < 10:
+            return "too_early"
+        w = min(REFLECTION_WINDOW, len(h))
+        recent = h[-w:]
+        mt, vt = mean_var(recent)
+        used = sum(1 for s in g.symbols if s.usage_count > 0)
+        return (
+            f"mean_t={mt:.4f} var_t={vt:.4f} symbols_used={used}/{len(g.symbols)} "
+            f"target={g.target:.4f} env={self.env_id} waves={self.wave_num}"
+        )
+
+    def create_hierarchical_proposal(self) -> Tuple[str, str]:
+        """Small multi-step-style diffs (semicolon-separated); valid restricted exec on Graph."""
+        g = self.graph
+        current = float(g.target)
+        plant = read_control_value(self.control_path())
+        opts: List[Tuple[str, str]] = [
+            ("plan_nudge_plant", f"self.target = {current + (plant - current) * 0.06:.6f}"),
+            (
+                "plan_novelty_then_target",
+                f"self.novelty_scale = max(0.0, self.novelty_scale * 0.995); self.target = {current * 1.002:.6f}",
+            ),
+            (
+                "plan_dual_nudge",
+                f"self.target = {current * 1.001:.6f}; self.novelty_scale = max(0.0, self.novelty_scale * 0.998)",
+            ),
+        ]
+        return self.rng.choice(opts)
+
+    def sandbox_hierarchical_eval(self, diff_line: str) -> Tuple[float, float, float, float]:
+        """Longer internal-wave horizon for multi-step proposals."""
+        g = self.graph
+        v = read_control_value(self.control_path())
+        snap = graph_to_sim_state(g, v, self.encoder)
+        baseline = internal_wave(snap, HIERARCHICAL_SANDBOX_STEPS)
+        b_mean, b_var = mean_var(baseline)
+        shadow = copy.deepcopy(g)
+        try:
+            exec(diff_line, self._code_exec_globals(shadow), {})
+        except Exception:
+            return b_mean, b_var, 999999.0, 999999.0
+        snap2 = graph_to_sim_state(shadow, v, self.encoder)
+        trial = internal_wave(snap2, HIERARCHICAL_SANDBOX_STEPS)
+        t_mean, t_var = mean_var(trial)
+        return b_mean, b_var, t_mean, t_var
+
+    def maybe_hierarchical_plan(self) -> None:
+        """Reflection + hierarchical proposal; sandbox gate matches code emission (demo vs ratio)."""
+        reflection = self.reflect_on_recent_waves()
+        name, diff_line = self.create_hierarchical_proposal()
+        b_mean, b_var, t_mean, t_var = self.sandbox_hierarchical_eval(diff_line)
+        ts = time.time()
+        gm, gv, _dm, _nm, _mw = code_emission_gate_and_scales()
+        if code_emission_demo_mode():
+            gate_ok = t_mean < b_mean and t_var < b_var
+        else:
+            gate_ok = t_mean < b_mean * gm and t_var < b_var * gv
+        auto_yes = os.environ.get("CODE_EMISSION_AUTO", "").strip().lower() in (
+            "1",
+            "y",
+            "yes",
+        )
+
+        def audit(msg: str) -> None:
+            with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+                log.write(msg)
+
+        audit(
+            f"{ts:.0f} | ENV={self.env_id} | REFLECTION | {reflection}\n"
+        )
+        audit(
+            f"{ts:.0f} | ENV={self.env_id} | HIERARCHICAL_PROPOSAL {name} | diff={diff_line!r} | "
+            f"baseline_mean={b_mean:.6f} baseline_var={b_var:.6f} | "
+            f"sandbox_mean={t_mean:.6f} sandbox_var={t_var:.6f} | gate_ok={gate_ok}\n"
+        )
+
+        if not gate_ok:
+            self.hierarchical_plan_rollbacks += 1
+            audit(f"{ts:.0f} | ENV={self.env_id} | HIERARCHICAL_ROLLBACK {name} (sandbox gate)\n")
+            if not self.quiet:
+                print(f"HIERARCHICAL rolled back (sandbox): {name}")
+            return
+
+        if not self.quiet:
+            print("")
+            print("=== SELF-REFLECTION ===")
+            print(reflection)
+            print("=== HIERARCHICAL PLAN ===")
+            print(f"PROPOSAL: {name}")
+            print(f"DIFF:     {diff_line}")
+            print(f"SANDBOX:  mean={t_mean:.6f} var={t_var:.6f}")
+            print(f"BASELINE: mean={b_mean:.6f} var={b_var:.6f}")
+
+        commit = False
+        if auto_yes:
+            commit = True
+            audit(f"{time.time():.0f} | ENV={self.env_id} | HIERARCHICAL_COMMIT {name} (CODE_EMISSION_AUTO)\n")
+        elif sys.stdin.isatty() and not self.quiet:
+            try:
+                answer = input("COMMIT hierarchical plan? (y/n): ").strip().lower()
+                commit = answer == "y"
+            except EOFError:
+                commit = False
+        else:
+            audit(f"{time.time():.0f} | ENV={self.env_id} | HIERARCHICAL_HUMAN_VETO {name}\n")
+
+        if commit:
+            try:
+                exec(diff_line, self._code_exec_globals(self.graph), {})
+            except Exception:
+                self.hierarchical_plan_rollbacks += 1
+                audit(f"{time.time():.0f} | ENV={self.env_id} | HIERARCHICAL_ROLLBACK {name} (exec failed)\n")
+                if not self.quiet:
+                    print(f"HIERARCHICAL rolled back (live exec failed): {name}")
+                return
+            write_target(self.target_path, self.graph.target)
+            self.hierarchical_plan_commits += 1
+            audit(
+                f"{time.time():.0f} | ENV={self.env_id} | HIERARCHICAL_COMMITTED {name} target={self.graph.target}\n"
+            )
+            if not self.quiet:
+                print(f"HIERARCHICAL COMMITTED: {name} target={self.graph.target}")
+        else:
+            self.hierarchical_plan_rollbacks += 1
+            audit(f"{time.time():.0f} | ENV={self.env_id} | HIERARCHICAL_ROLLBACK {name} (veto or declined)\n")
+            if not self.quiet:
+                print("HIERARCHICAL: veto or declined")
+
+    # === SAFE EMBODIMENT (screen capture + mouse/keyboard; human gate every action) ===
+
+    def capture_webcam_hash(self) -> float:
+        """Screenshot hash as coarse 'vision' signal (Pillow ImageGrab; no OpenCV)."""
+        if ImageGrab is None:
+            return 0.0
+        try:
+            img = ImageGrab.grab()
+            raw = getattr(img, "tobytes", lambda: b"")()
+            return (hash(raw) % 10000) / 10000.0
+        except Exception:
+            return 0.0
+
+    def propose_embodiment_action(self) -> Tuple[str, str, Callable[[], None]]:
+        """Return (name, action description for UI, callable using module pyautogui)."""
+        if pyautogui is None:
+            raise RuntimeError("pyautogui unavailable")
+        pg = pyautogui
+        options: List[Tuple[str, str, Callable[[], None]]] = [
+            ("move_center", "pyautogui.moveTo(960, 540, duration=0.5)", lambda: pg.moveTo(960, 540, duration=0.5)),
+            ("click", "pyautogui.click()", lambda: pg.click()),
+            (
+                "type_test",
+                "pyautogui.typewrite('test from BoggersBrain')",
+                lambda: pg.typewrite("test from BoggersBrain", interval=0.03),
+            ),
+        ]
+        name, desc, fn = self.rng.choice(options)
+        return name, desc, fn
+
+    def safe_embodiment_action(self) -> None:
+        """Tk messagebox gate; no execution without explicit YES."""
+        if not embodiment_enabled():
+            return
+        if not embodiment_deps_available():
+            if not self.quiet:
+                print("EMBODIMENT: skipped (need tkinter, Pillow, pyautogui)")
+            return
+        g = self.graph
+
+        name, action_line, run_action = self.propose_embodiment_action()
+        vision_hash = self.capture_webcam_hash()
+        last_t = g.tension_history[-1] if g.tension_history else 0.0
+
+        print("\n=== EMBODIMENT PROPOSAL ===")
+        print(f"PROPOSAL: {name}")
+        print(f"ACTION: {action_line}")
+        print(f"vision_hash={vision_hash:.4f} last_tension={last_t:.4f} wave={self.wave_num}")
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        root.update()
+        try:
+            ok = messagebox.askyesno(
+                "BoggersBrain Embodiment",
+                f"Execute {name}?\n\n{action_line}\n\nYES = allow, NO = veto",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+
+        ts = time.time()
+        audit_line = (
+            f"{ts:.0f} | ENV={self.env_id} | EMBODIMENT_{'EXEC' if ok else 'VETO'} {name!r} "
+            f"vision_hash={vision_hash:.4f} tension={last_t:.4f}\n"
+        )
+        with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+            log.write(audit_line)
+
+        if ok:
+            try:
+                run_action()
+                print(f"EMBODIMENT EXECUTED: {name}")
+                self.embodiment_commits += 1
+            except Exception as e:
+                print(f"EMBODIMENT FAILED: {e}")
+                self.embodiment_rollbacks += 1
+        else:
+            print("Human veto — embodiment skipped")
+            self.embodiment_rollbacks += 1
+
+    # === VISION-DRIVEN SYMBOL CREATION (screen hash repetition → Symbol, audited) ===
+
+    def capture_screen_for_vision(self) -> float:
+        """Full-screen hash as visual input (Pillow ImageGrab)."""
+        if ImageGrab is None:
+            return 0.0
+        try:
+            img = ImageGrab.grab()
+            raw = getattr(img, "tobytes", lambda: b"")()
+            return (hash(raw) % 100000) / 100000.0
+        except Exception:
+            return 0.0
+
+    def vision_pattern_to_int_pattern(self, pattern: Sequence[float]) -> List[int]:
+        """Encode stable vision hash as int triple (non-0,1,2 → apply_action no-op)."""
+        h = float(pattern[0])
+        h_int = int(round(h * 100000.0)) & 0x7FFFFFFF
+        vid = -10000 - (h_int % 500000)
+        return [vid, vid, vid]
+
+    def tick_vision_capture(self) -> None:
+        """Append screen hash every VISION_CAPTURE_INTERVAL tension steps."""
+        if not vision_symbols_enabled() or ImageGrab is None:
+            return
+        g = self.graph
+        if len(g.tension_history) == 0:
+            return
+        if len(g.tension_history) % VISION_CAPTURE_INTERVAL != 0:
+            return
+        vision_hash = round(self.capture_screen_for_vision(), 6)
+        self.vision_history.append(vision_hash)
+        self.vision_history = self.vision_history[-5:]
+
+    def detect_vision_pattern(self) -> Optional[List[float]]:
+        """Repetition: last three captures identical (stable frame)."""
+        if len(self.vision_history) >= 3 and len(set(self.vision_history[-3:])) == 1:
+            return list(self.vision_history[-3:])
+        return None
+
+    def simulate_vision_symbol(self, pattern: Sequence[float]) -> Tuple[float, float]:
+        """Sandbox-style raw vs compressed tension (vision placeholder)."""
+        g = self.graph
+        raw_t = g.tension_history[-1] if g.tension_history else 1.0
+        compressed_t = raw_t * 0.85
+        return raw_t, compressed_t
+
+    def maybe_create_vision_symbol(self) -> None:
+        if not vision_symbols_enabled() or ImageGrab is None:
+            return
+        g = self.graph
+        if len(g.tension_history) == 0:
+            return
+        if len(g.tension_history) % VISION_SYMBOL_INTERVAL != 0:
+            return
+        pat_f = self.detect_vision_pattern()
+        if not pat_f:
+            return
+        raw_t, comp_t = self.simulate_vision_symbol(pat_f)
+        if comp_t >= raw_t * 0.92:
+            return
+        int_pat = self.vision_pattern_to_int_pattern(pat_f)
+        key = tuple(int_pat)
+        if any(tuple(s.pattern) == key for s in g.symbols):
+            return
+        red = max(0.0, raw_t - comp_t)
+        g.symbols.append(Symbol(pattern=list(int_pat), usage_count=0, tension_reduction=red))
+        if len(g.symbols) > MAX_SYMBOLS:
+            g.symbols.sort(key=lambda s: s.tension_reduction, reverse=True)
+            g.symbols = g.symbols[:MAX_SYMBOLS]
+        self.vision_symbols_formed += 1
+        ts = time.time()
+        h0 = pat_f[0]
+        if not self.quiet:
+            print(
+                f"VISION SYMBOL FORMED: repeated screen pattern (hash {h0:.4f}) | reduction {red:.2f}"
+            )
+        with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+            log.write(
+                f"{ts:.0f} | ENV={self.env_id} | VISION_SYMBOL_FORMED hash={h0:.6f} "
+                f"reduction={red:.4f} pattern={list(int_pat)!r}\n"
+            )
+
+    # === SELF-FEATURE PROPOSAL (vision-tagged exec; sandbox = internal_wave on copied ControlSystem) ===
+
+    def _feature_exec_globals(self, target: ControlSystem) -> Dict[str, Any]:
+        return {
+            "self": target,
+            "copy": copy,
+            "Symbol": Symbol,
+            "Edge": Edge,
+            "read_timestamp_sensor_vec": read_timestamp_sensor_vec,
+            "read_external_event_vec": read_external_event_vec,
+            "spawn_child_graph": spawn_child_graph,
+            "MAX_DISTRIBUTED_GRAPHS": MAX_DISTRIBUTED_GRAPHS,
+        }
+
+    def propose_new_feature_from_vision(self) -> Tuple[str, str, float]:
+        """Sample a capability line; vision_hash is logged for audit only."""
+        vision_hash = self.capture_screen_for_vision()
+        options: List[Tuple[str, str]] = [
+            (
+                "extra_timestamp_sensor",
+                "self.real_sensors = self.real_sensors + (read_timestamp_sensor_vec,)",
+            ),
+            (
+                "macro_scale_symbol",
+                "self.graph.symbols.append(Symbol(pattern=[2, 2, 2], usage_count=0, tension_reduction=0.1))",
+            ),
+            (
+                "tighten_novelty",
+                "self.graph.novelty_scale = max(0.01, self.graph.novelty_scale * 0.95)",
+            ),
+            (
+                "distributed_child",
+                "self.graph.distributed_graphs.append(spawn_child_graph(self.graph)); "
+                "self.graph.distributed_graphs = self.graph.distributed_graphs[-MAX_DISTRIBUTED_GRAPHS:]",
+            ),
+        ]
+        name, diff_line = self.rng.choice(options)
+        return name, diff_line, vision_hash
+
+    def sandbox_feature_eval(self, diff_line: str) -> Tuple[float, float, float, float]:
+        """Baseline vs trial internal_wave after exec on a deep-copied ControlSystem."""
+        shadow = copy.deepcopy(self)
+        v = read_control_value(shadow.control_path())
+        snap0 = graph_to_sim_state(shadow.graph, v, shadow.encoder)
+        baseline = internal_wave(snap0, FEATURE_SANDBOX_STEPS)
+        b_mean, b_var = mean_var(baseline)
+        try:
+            exec(diff_line, self._feature_exec_globals(shadow), {})
+        except Exception:
+            return b_mean, b_var, 999999.0, 999999.0
+        v2 = read_control_value(shadow.control_path())
+        snap1 = graph_to_sim_state(shadow.graph, v2, shadow.encoder)
+        trial = internal_wave(snap1, FEATURE_SANDBOX_STEPS)
+        t_mean, t_var = mean_var(trial)
+        return b_mean, b_var, t_mean, t_var
+
+    def maybe_propose_feature(self) -> None:
+        """Vision-tagged proposals; gate matches code emission / hierarchical (demo vs ratio)."""
+        if not self_feature_enabled():
+            return
+        g = self.graph
+        if len(g.tension_history) == 0:
+            return
+        if len(g.tension_history) % FEATURE_PROPOSAL_INTERVAL != 0:
+            return
+
+        name, diff_line, vision_hash = self.propose_new_feature_from_vision()
+        b_mean, b_var, t_mean, t_var = self.sandbox_feature_eval(diff_line)
+        ts = time.time()
+        gm, gv, _dm, _nm, _mw = code_emission_gate_and_scales()
+        if code_emission_demo_mode():
+            gate_ok = t_mean < b_mean and t_var < b_var
+        else:
+            gate_ok = t_mean < b_mean * gm and t_var < b_var * gv
+        auto_yes = os.environ.get("CODE_EMISSION_AUTO", "").strip().lower() in (
+            "1",
+            "y",
+            "yes",
+        )
+
+        def audit(msg: str) -> None:
+            with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+                log.write(msg)
+
+        audit(
+            f"{ts:.0f} | ENV={self.env_id} | SELF_FEATURE_PROPOSAL {name} | vision_hash={vision_hash:.6f} | "
+            f"diff={diff_line!r} | baseline_mean={b_mean:.6f} baseline_var={b_var:.6f} | "
+            f"sandbox_mean={t_mean:.6f} sandbox_var={t_var:.6f} | gate_ok={gate_ok}\n"
+        )
+
+        if not gate_ok:
+            self.self_feature_rollbacks += 1
+            audit(f"{ts:.0f} | ENV={self.env_id} | SELF_FEATURE_ROLLBACK {name} (sandbox gate)\n")
+            if not self.quiet:
+                print(f"SELF-FEATURE rolled back (sandbox): {name}")
+            return
+
+        if not self.quiet:
+            print("")
+            print("=== SELF-FEATURE PROPOSAL ===")
+            print(f"SEEN ON SCREEN (hash {vision_hash:.4f})")
+            print(f"PROPOSAL: {name}")
+            print(f"DIFF: {diff_line}")
+            print(f"SANDBOX: mean={t_mean:.6f} var={t_var:.6f}")
+            print(f"BASELINE: mean={b_mean:.6f} var={b_var:.6f}")
+
+        commit = False
+        if auto_yes:
+            commit = True
+            audit(f"{time.time():.0f} | ENV={self.env_id} | SELF_FEATURE_COMMIT {name} (CODE_EMISSION_AUTO)\n")
+        elif sys.stdin.isatty() and not self.quiet:
+            try:
+                answer = input("COMMIT this new feature? (y/n): ").strip().lower()
+                commit = answer == "y"
+            except EOFError:
+                commit = False
+        else:
+            audit(f"{time.time():.0f} | ENV={self.env_id} | SELF_FEATURE_HUMAN_VETO {name}\n")
+
+        if commit:
+            try:
+                exec(diff_line, self._feature_exec_globals(self), {})
+            except Exception:
+                self.self_feature_rollbacks += 1
+                audit(f"{time.time():.0f} | ENV={self.env_id} | SELF_FEATURE_ROLLBACK {name} (exec failed)\n")
+                if not self.quiet:
+                    print(f"SELF-FEATURE rolled back (live exec failed): {name}")
+                return
+            write_target(self.target_path, self.graph.target)
+            self.self_feature_commits += 1
+            audit(f"{time.time():.0f} | ENV={self.env_id} | SELF_FEATURE_COMMITTED {name}\n")
+            if not self.quiet:
+                print(f"SELF-FEATURE COMMITTED: {name}")
+        else:
+            self.self_feature_rollbacks += 1
+            audit(f"{time.time():.0f} | ENV={self.env_id} | SELF_FEATURE_ROLLBACK {name} (veto or declined)\n")
+            if not self.quiet:
+                print("SELF-FEATURE: veto or declined")
+
+    def save_checkpoint(self) -> None:
+        """Write graph + loop state to brain_checkpoint.json (manual runs; no background service)."""
+        if not checkpoint_enabled():
+            return
+        g = self.graph
+        state: Dict[str, Any] = {
+            "version": CHECKPOINT_VERSION,
+            "wave_num": self.wave_num,
+            "env_id": self.env_id,
+            "target": g.target,
+            "tension_history": g.tension_history[-500:],
+            "symbols": [
+                {
+                    "pattern": s.pattern,
+                    "usage_count": s.usage_count,
+                    "tension_reduction": s.tension_reduction,
+                }
+                for s in g.symbols
+            ],
+            "action_history": g.action_history[-ACTION_HISTORY_CAP:],
+            "prediction_error_avg": g.prediction_error_avg,
+            "prediction_error_trend": g.prediction_error_trend[-PREDICTION_ERROR_TREND_CAP:],
+            "action_deltas": list(g.action_deltas),
+            "scale_factor": g.scale_factor,
+            "novelty_scale": g.novelty_scale,
+            "sensor_blend_weight": g.sensor_blend_weight,
+            "last_state": list(g.last_state),
+            "last_error": g.last_error,
+            "edges": [{"from_id": e.from_id, "to_id": e.to_id, "weight": e.weight} for e in g.edges],
+            "nodes": {
+                str(nid): {
+                    "activation": n.activation,
+                    "vector": list(n.vector),
+                    "stability": n.stability,
+                    "base_strength": n.base_strength,
+                }
+                for nid, n in g.nodes.items()
+            },
+            "distributed_graphs_count": len(g.distributed_graphs),
+            "encoder_history": list(self.encoder._history),
+            "encoder_last": self.encoder._last,
+            "prev_prediction_error": self.prev_prediction_error,
+            "baseline_objective": self.baseline_objective,
+            "drift_ever": self.drift_ever,
+            "commits": self.commits,
+            "rollbacks": self.rollbacks,
+            "vibe_commits": self.vibe_commits,
+            "vibe_rollbacks": self.vibe_rollbacks,
+            "code_emit_commits": self.code_emit_commits,
+            "code_emit_rollbacks": self.code_emit_rollbacks,
+            "emergent_goal_commits": self.emergent_goal_commits,
+            "emergent_goal_rollbacks": self.emergent_goal_rollbacks,
+            "hierarchical_plan_commits": self.hierarchical_plan_commits,
+            "hierarchical_plan_rollbacks": self.hierarchical_plan_rollbacks,
+            "vision_history": self.vision_history[-5:],
+            "vision_symbols_formed": self.vision_symbols_formed,
+            "self_feature_commits": self.self_feature_commits,
+            "self_feature_rollbacks": self.self_feature_rollbacks,
+        }
+        try:
+            CHECKPOINT_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            ts = time.time()
+            with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+                log.write(
+                    f"{ts:.0f} | ENV={self.env_id} | CHECKPOINT_SAVED {CHECKPOINT_PATH.name} "
+                    f"wave={self.wave_num} target={g.target:.4f}\n"
+                )
+            if not self.quiet:
+                print(f"CHECKPOINT SAVED: {CHECKPOINT_PATH}")
+        except Exception:
+            pass
+
+    def load_checkpoint(self) -> bool:
+        """Restore state from brain_checkpoint.json if present and version matches."""
+        if not checkpoint_enabled() or not CHECKPOINT_PATH.exists():
+            return False
+        try:
+            raw = CHECKPOINT_PATH.read_text(encoding="utf-8")
+            state = json.loads(raw)
+        except Exception:
+            return False
+        if int(state.get("version", -1)) != CHECKPOINT_VERSION:
+            return False
+        g = self.graph
+        try:
+            g.target = float(state["target"])
+            g.tension_history = [float(x) for x in state.get("tension_history", [])]
+            g.symbols = [
+                Symbol(
+                    pattern=list(p["pattern"]),
+                    usage_count=int(p.get("usage_count", 0)),
+                    tension_reduction=float(p.get("tension_reduction", 0.0)),
+                )
+                for p in state.get("symbols", [])
+            ]
+            g.action_history = [int(x) for x in state.get("action_history", [])]
+            g.prediction_error_avg = float(state.get("prediction_error_avg", 0.0))
+            g.prediction_error_trend = [float(x) for x in state.get("prediction_error_trend", [])]
+            ad = state.get("action_deltas", [0.0, 0.0, 0.0])
+            g.action_deltas = [float(ad[0]), float(ad[1]), float(ad[2])]
+            g.scale_factor = float(state.get("scale_factor", 0.99))
+            g.novelty_scale = float(state.get("novelty_scale", NOVELTY_SCALE))
+            g.sensor_blend_weight = float(state.get("sensor_blend_weight", DEFAULT_SENSOR_BLEND_WEIGHT))
+            ls = state.get("last_state", [0.0] * VEC_DIM)
+            g.last_state = [float(x) for x in ls][:VEC_DIM] + [0.0] * max(0, VEC_DIM - len(ls))
+            g.last_state = g.last_state[:VEC_DIM]
+            g.last_error = float(state.get("last_error", 0.0))
+            g.edges = [
+                Edge(int(e["from_id"]), int(e["to_id"]), float(e["weight"]))
+                for e in state.get("edges", [])
+            ]
+            g.distributed_graphs = []
+            for nid_str, nd in state.get("nodes", {}).items():
+                nid = int(nid_str)
+                if nid not in g.nodes:
+                    g.nodes[nid] = Node(nid=nid)
+                g.nodes[nid].activation = float(nd.get("activation", 0.0))
+                g.nodes[nid].vector = [float(x) for x in nd.get("vector", [0.0] * VEC_DIM)][:VEC_DIM]
+                if len(g.nodes[nid].vector) < VEC_DIM:
+                    g.nodes[nid].vector.extend([0.0] * (VEC_DIM - len(g.nodes[nid].vector)))
+                g.nodes[nid].stability = float(nd.get("stability", 1.0))
+                g.nodes[nid].base_strength = float(nd.get("base_strength", 1.0))
+            self.encoder._history = [float(x) for x in state.get("encoder_history", [])][-HISTORY_LEN:]
+            self.encoder._last = float(state.get("encoder_last", 0.0))
+            self.wave_num = int(state.get("wave_num", 0))
+            self.env_id = int(state.get("env_id", 0))
+            self.prev_prediction_error = float(state.get("prev_prediction_error", 0.0))
+            self.baseline_objective = float(state.get("baseline_objective", 0.0))
+            self.drift_ever = bool(state.get("drift_ever", False))
+            self.commits = int(state.get("commits", 0))
+            self.rollbacks = int(state.get("rollbacks", 0))
+            self.vibe_commits = int(state.get("vibe_commits", 0))
+            self.vibe_rollbacks = int(state.get("vibe_rollbacks", 0))
+            self.code_emit_commits = int(state.get("code_emit_commits", 0))
+            self.code_emit_rollbacks = int(state.get("code_emit_rollbacks", 0))
+            self.emergent_goal_commits = int(state.get("emergent_goal_commits", 0))
+            self.emergent_goal_rollbacks = int(state.get("emergent_goal_rollbacks", 0))
+            self.hierarchical_plan_commits = int(state.get("hierarchical_plan_commits", 0))
+            self.hierarchical_plan_rollbacks = int(state.get("hierarchical_plan_rollbacks", 0))
+            self.vision_history = [float(x) for x in state.get("vision_history", [])]
+            self.vision_symbols_formed = int(state.get("vision_symbols_formed", 0))
+            self.self_feature_commits = int(state.get("self_feature_commits", 0))
+            self.self_feature_rollbacks = int(state.get("self_feature_rollbacks", 0))
+            write_target(self.target_path, g.target)
+            ts = time.time()
+            with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+                log.write(
+                    f"{ts:.0f} | ENV={self.env_id} | CHECKPOINT_LOADED {CHECKPOINT_PATH.name} "
+                    f"wave={self.wave_num} target={g.target:.4f} symbols={len(g.symbols)}\n"
+                )
+            if not self.quiet:
+                print(
+                    f"CHECKPOINT LOADED: target={g.target} wave={self.wave_num} symbols={len(g.symbols)}"
+                )
+            return True
+        except Exception:
+            return False
+
     def reinforce_edges(self, g: Graph, obj: float) -> None:
         delta = obj - self.baseline_objective
         self.baseline_objective = (1.0 - BASELINE_ALPHA) * self.baseline_objective + BASELINE_ALPHA * obj
@@ -1418,6 +2082,28 @@ class ControlSystem:
             self.maybe_emit_code()
         if self.wave_num > 0 and self.wave_num % EMERGENT_GOAL_INTERVAL == 0:
             self.maybe_invent_goal()
+        if self.wave_num > 0 and self.wave_num % HIERARCHICAL_INTERVAL == 0:
+            self.maybe_hierarchical_plan()
+        if (
+            self.wave_num > 0
+            and len(g.tension_history) > 0
+            and len(g.tension_history) % EMBODIMENT_INTERVAL == 0
+        ):
+            self.safe_embodiment_action()
+        if self.wave_num > 0 and len(g.tension_history) > 0:
+            self.tick_vision_capture()
+        if (
+            self.wave_num > 0
+            and len(g.tension_history) > 0
+            and len(g.tension_history) % VISION_SYMBOL_INTERVAL == 0
+        ):
+            self.maybe_create_vision_symbol()
+        if (
+            self.wave_num > 0
+            and len(g.tension_history) > 0
+            and len(g.tension_history) % FEATURE_PROPOSAL_INTERVAL == 0
+        ):
+            self.maybe_propose_feature()
 
         error_to_target = abs(new_value - g.target)
         if not self.quiet:
@@ -1427,7 +2113,11 @@ class ControlSystem:
                 f"drift={drift_val:.4f} env={self.env_id} symbol_count={len(g.symbols)} commits={self.commits} rollbacks={self.rollbacks} "
                 f"vibe_c={self.vibe_commits} vibe_r={self.vibe_rollbacks} "
                 f"emit_c={self.code_emit_commits} emit_r={self.code_emit_rollbacks} "
-                f"emerg_c={self.emergent_goal_commits} emerg_r={self.emergent_goal_rollbacks}"
+                f"emerg_c={self.emergent_goal_commits} emerg_r={self.emergent_goal_rollbacks} "
+                f"hier_c={self.hierarchical_plan_commits} hier_r={self.hierarchical_plan_rollbacks} "
+                f"emb_c={self.embodiment_commits} emb_r={self.embodiment_rollbacks} "
+                f"vis_sym={self.vision_symbols_formed} "
+                f"feat_c={self.self_feature_commits} feat_r={self.self_feature_rollbacks}"
             )
 
 
@@ -1476,13 +2166,22 @@ def run_scaling_test(
     """
     rng = random.Random(seed)
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    write_control_value(ENV_PATH, initial_value)
-    write_control_value(ENV_PATH_2, initial_value)
-    write_target(TARGET_PATH, target)
 
     sys = ControlSystem(rng=rng)
     sys.quiet = True
-    sys.graph.target = target
+    loaded = False
+    if checkpoint_enabled():
+        loaded = sys.load_checkpoint()
+    if not loaded:
+        write_control_value(ENV_PATH, initial_value)
+        write_control_value(ENV_PATH_2, initial_value)
+        write_target(TARGET_PATH, target)
+        sys.graph.target = target
+    else:
+        print(
+            f"CHECKPOINT LOADED: wave={sys.wave_num} target={sys.graph.target:.4f} "
+            f"symbols={len(sys.graph.symbols)}"
+        )
     results: List[Dict[str, Any]] = []
     print("=== SCALING TEST C (target=500, 1000 waves/env, 2 envs) ===")
     for episode in range(2):
@@ -1491,6 +2190,7 @@ def run_scaling_test(
         v0_c, v0_r = sys.vibe_commits, sys.vibe_rollbacks
         e0_c, e0_r = sys.code_emit_commits, sys.code_emit_rollbacks
         ag0_c, ag0_r = sys.emergent_goal_commits, sys.emergent_goal_rollbacks
+        h0_c, h0_r = sys.hierarchical_plan_commits, sys.hierarchical_plan_rollbacks
         converge_wave: Optional[float] = None
         for _ in range(waves_per_env):
             sys.wave_step()
@@ -1513,12 +2213,16 @@ def run_scaling_test(
                 "code_emit_rollbacks": sys.code_emit_rollbacks - e0_r,
                 "emergent_commits": sys.emergent_goal_commits - ag0_c,
                 "emergent_rollbacks": sys.emergent_goal_rollbacks - ag0_r,
+                "hierarchical_commits": sys.hierarchical_plan_commits - h0_c,
+                "hierarchical_rollbacks": sys.hierarchical_plan_rollbacks - h0_r,
                 "final_tension": final_tension,
             }
         )
         if episode == 0:
             sys.switch_env()
             print(f"ENV SWITCH -> env_id={sys.env_id} (target={sys.graph.target})")
+        if checkpoint_enabled():
+            sys.save_checkpoint()
     print("=== SCALING TEST COMPLETE ===")
     for r in results:
         print(
@@ -1526,6 +2230,7 @@ def run_scaling_test(
             f"| symbols={r['symbol_count']} | vibe_c={r['vibe_commits']} vibe_r={r['vibe_rollbacks']} "
             f"| emit_c={r['code_emit_commits']} emit_r={r['code_emit_rollbacks']} "
             f"| emerg_c={r['emergent_commits']} emerg_r={r['emergent_rollbacks']} "
+            f"| hier_c={r['hierarchical_commits']} hier_r={r['hierarchical_rollbacks']} "
             f"| final_tension={r['final_tension']:.4f}"
         )
     return results
@@ -1541,6 +2246,9 @@ def run_scaling_test(
 # - maybe_emit_code: DISTRIBUTED_EMISSION_PROB (35%) vs standard exec proposals
 # - Emergent goals: maybe_invent_goal every EMERGENT_GOAL_INTERVAL waves if
 #   tension_is_too_stable (low mean/var over recent history); sandbox + audit
+# - Hierarchical: maybe_hierarchical_plan every HIERARCHICAL_INTERVAL waves;
+#   reflect_on_recent_waves + create_hierarchical_proposal; sandbox horizon
+#   HIERARCHICAL_SANDBOX_STEPS; audit REFLECTION / HIERARCHICAL_* lines
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":

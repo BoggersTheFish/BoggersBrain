@@ -9,3 +9,4 @@ venv/
 .idea/
 .vscode/
 vibe_code_audit.log
+brain_checkpoint.json
