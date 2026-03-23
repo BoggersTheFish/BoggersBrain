@@ -34,7 +34,8 @@ That makes it useful for:
 7. **Self-mod** only inside **sandbox** simulations (`maybe_mutate_sandbox_only`), committing a single edge tweak if mean **and** variance of tension over the sandbox horizon improve.
 8. **Vibe-code** (`maybe_vibe_code`): periodic proposals as **Python callables** on a **shadow graph**; commit only if internal-wave mean **and** variance improve; full **audit** with `ENV=` tags.
 9. **Code emission** (`maybe_emit_code`): restricted **`exec`** strings with a **strict gate** (production: ratio thresholds; demo mode: vibe-style or distributed-specific rules); optional **human** or **`CODE_EMISSION_AUTO`** commit; audit trail.
-10. **Phase 5**: **real sensors** (wall clock + optional `external_event.txt`) blended into the sensor vector on a fixed interval; **distributed** proposals append **child graphs** and score an **ensemble** internal-wave metric.
+10. **Phase 5**: **real sensors** (wall clock + optional `external_event.txt`) blended into the sensor vector with configurable **`sensor_blend_weight`** (default **0.3**); **distributed** proposals append **child graphs** and score an **ensemble** internal-wave metric.
+11. **Emergent goals** (`maybe_invent_goal`): when real-wave **tension** has been **too calm** for long enough (low mean and variance over a sliding window), the system proposes **small, sandbox-safe** target changes—**nudge toward plant**, **micro** / **incremental** bumps or trims, optional **compound** symbol append. Proposals are scored with the same **`internal_wave`** horizon as other emissions. **Strict** gate: trial mean/var must beat baseline by **`EMERGENT_GATE_MEAN_RATIO` / `EMERGENT_GATE_VAR_RATIO`** (defaults **0.95** / **0.9**). Set **`EMERGENT_RELAX_GATE=y`** for a slightly looser exploration gate (still logged). Successful commits **`write_target()`** so `control_target.txt` stays in sync.
 
 ---
 
@@ -47,9 +48,9 @@ That makes it useful for:
 | 2 | **Motor** — action selection pressure |
 | 3 | **Meta** — graph statistics & tension context |
 
-Edges are directed; weights adapt from the **objective** (`reinforce_edges`). The **Graph** also stores **symbols**, **action history**, **tension history**, **prediction-error EMA/trend**, **action deltas** and **scale factor** for the hybrid predictor, **`novelty_scale`**, and **`distributed_graphs`** (Phase 5).
+Edges are directed; weights adapt from the **objective** (`reinforce_edges`). The **Graph** also stores **symbols**, **action history**, **tension history**, **prediction-error EMA/trend**, **action deltas** and **scale factor** for the hybrid predictor, **`novelty_scale`**, **`distributed_graphs`** (Phase 5), and **`sensor_blend_weight`**.
 
-The **`ControlSystem`** owns the **`Graph`**, **`SensorEncoder`**, environment paths (`control_path()`), wave counter, drift flags, and commit/rollback counters (`commits`, `rollbacks`, `vibe_*`, `code_emit_*`).
+The **`ControlSystem`** owns the **`Graph`**, **`SensorEncoder`**, **`real_sensors`** callables, environment paths (`control_path()`), wave counter, drift flags, and commit/rollback counters (`commits`, `rollbacks`, `vibe_*`, `code_emit_*`, `emergent_goal_*`).
 
 ---
 
@@ -64,6 +65,7 @@ The **`ControlSystem`** owns the **`Graph`**, **`SensorEncoder`**, environment p
 | **Multi-env (scaling C)** | Two files, `env_id`, `run_scaling_test()`, ENV-tagged audits. |
 | **Code emission (B)** | Restricted `exec`; human or `CODE_EMISSION_AUTO`; `CODE_EMISSION_*` env tuning. |
 | **Phase 5** | Real sensors + `distributed_graphs` + distributed sandbox scoring + occasional spawn proposals. |
+| **Emergent goals** | When tension is “too stable,” refined target proposals + sandbox; optional **`EMERGENT_RELAX_GATE`**. |
 
 ---
 
@@ -76,7 +78,7 @@ The **`ControlSystem`** owns the **`Graph`**, **`SensorEncoder`**, environment p
 | `control_value_2.txt` | Second scalar channel for multi-environment tests. |
 | `control_target.txt` | Goal scalar for the controller. |
 | `external_event.txt` | Optional **Phase 5** external scalar (created if missing). |
-| `vibe_code_audit.log` | **Append-only** audit (proposals, commits, rollbacks, `ENV=`, code emission lines). Ignored by git (regenerates). |
+| `vibe_code_audit.log` | **Append-only** audit (proposals, commits, rollbacks, `ENV=`, code emission, **`EMERGENT_GOAL_*`** lines). Ignored by git (regenerates). |
 
 ---
 
@@ -102,7 +104,7 @@ Runs **`run_scaling_test`** (target 500, 1000 waves per environment, two envs, q
 
 From Python or a small script, call `run_episode(waves, seed, initial_value, target, quiet=...)`.
 
-### Phase 5 + code emission demo (example)
+### Phase 5 + code emission + emergent goals (example)
 
 PowerShell:
 
@@ -110,6 +112,8 @@ PowerShell:
 $env:CODE_EMISSION_DEMO = "y"
 $env:CODE_EMISSION_AUTO = "y"
 $env:CODE_EMISSION_INTERVAL = "50"
+# Optional: loosen emergent sandbox gate slightly for exploration demos (still audited)
+$env:EMERGENT_RELAX_GATE = "y"
 python closed_loop_control.py
 ```
 
@@ -126,6 +130,9 @@ Optional: write numbers to `external_event.txt` while the process runs to exerci
 | `CODE_EMISSION_INTERVAL` | Waves between emission attempts (default 200). |
 | `CODE_EMISSION_GATE_MEAN`, `CODE_EMISSION_GATE_VAR` | Override production ratio gate factors. |
 | `CODE_EMISSION_DELTA_MULT`, `CODE_EMISSION_NOVELTY_MULT`, `CODE_EMISSION_META_W` | Tune proposal strengths. |
+| `EMERGENT_RELAX_GATE` | `y` / `1` / `yes` — use a looser emergent-goal gate (exploration); audit logs `emergent_relax=True`. |
+
+**Key constants** (edit in `closed_loop_control.py`): `EMERGENT_GOAL_INTERVAL` (default **400**), `EMERGENT_STABLE_*` (tension “boredom” detection), `EMERGENT_GATE_MEAN_RATIO` / `EMERGENT_GATE_VAR_RATIO`, `DISTRIBUTED_EMISSION_PROB` (**0.35**), `REAL_SENSOR_INTERVAL` (**50**).
 
 Vibe and mutation intervals are **constants** at the top of `closed_loop_control.py` (`VIBE_INTERVAL`, `MUTATION_EVERY`, etc.).
 
@@ -135,7 +142,7 @@ Vibe and mutation intervals are **constants** at the top of `closed_loop_control
 
 - **Sandboxes** never perform irreversible writes to control files during evaluation of a candidate mutation.
 - **Commits** (edge mutation, vibe callable, `exec` diff) happen only after **recorded** baseline vs trial metrics pass the gate.
-- **Audit log** lines include timestamps, **`ENV=`** for environment-aware proposals, **`phase5_distributed=`** for emission type, and rollback reasons.
+- **Audit log** lines include timestamps, **`ENV=`** for environment-aware proposals, **`phase5_distributed=`** for emission type, **`EMERGENT_GOAL_*`** for emergent goal proposals/commits/rollbacks, and rollback reasons.
 
 This is **not** a substitute for OS-level isolation: restricted `exec` is still `exec`; Phase 5 documentation in code assumes trusted use. For untrusted proposals, run in a container or subprocess sandbox (future work).
 
@@ -146,6 +153,7 @@ This is **not** a substitute for OS-level isolation: restricted `exec` is still 
 - **Single process**, single main graph; **distributed** children are stored and scored in emission sandbox; live `wave_step` does not yet run a full coupled multi-graph simulation.
 - **Scalar plant** is intentionally tiny; scaling to rich sensors is API-sized, not production robotics.
 - **Tuning** (intervals, gates) affects how often commits occur; conservative defaults favor **no change** near a good attractor.
+- **Emergent goals**: large random target jumps fail the sandbox by design (tension spikes). **Small** nudges and **relaxed** gate mode are needed to observe occasional commits in practice.
 
 ---
 

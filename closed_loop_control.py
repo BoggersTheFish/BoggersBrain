@@ -58,7 +58,18 @@ VIBE_INTERVAL = 100
 CODE_EMISSION_INTERVAL = 200
 REAL_SENSOR_INTERVAL = 50
 MAX_DISTRIBUTED_GRAPHS = 4
-DISTRIBUTED_EMISSION_PROB = 0.3
+DISTRIBUTED_EMISSION_PROB = 0.35
+DEFAULT_SENSOR_BLEND_WEIGHT = 0.3
+EMERGENT_GOAL_INTERVAL = 400
+# Must fit in TENSION_HISTORY_CAP (200); "300 waves" intent uses min(window, len(history)).
+EMERGENT_STABLE_WINDOW = 300
+EMERGENT_STABLE_MEAN_MAX = 0.5
+EMERGENT_STABLE_VAR_MAX = 0.1
+# Refined emergent goals: sandbox must beat baseline internal-wave stats by these ratios.
+EMERGENT_GATE_MEAN_RATIO = 0.95
+EMERGENT_GATE_VAR_RATIO = 0.9
+# If set to 1/y/yes: allow small regression vs baseline (exploration) — see maybe_invent_goal().
+EMERGENT_RELAX_GATE_ENV = "EMERGENT_RELAX_GATE"
 # Spawn a shadow graph for parallel internal-wave scoring (no invalid extra node ids).
 DISTRIBUTED_SPAWN_DIFF = (
     "self.distributed_graphs.append(spawn_child_graph(self)); "
@@ -95,6 +106,10 @@ def code_emission_gate_and_scales() -> Tuple[float, float, float, float, float]:
 
 def code_emission_demo_mode() -> bool:
     return os.environ.get("CODE_EMISSION_DEMO", "").strip().lower() in ("1", "y", "yes")
+
+
+def emergent_relax_gate() -> bool:
+    return os.environ.get(EMERGENT_RELAX_GATE_ENV, "").strip().lower() in ("1", "y", "yes")
 
 
 def code_emission_interval_waves() -> int:
@@ -175,6 +190,7 @@ class Graph:
     scale_factor: float = 0.99
     novelty_scale: float = NOVELTY_SCALE
     distributed_graphs: List[Graph] = field(default_factory=list)
+    sensor_blend_weight: float = DEFAULT_SENSOR_BLEND_WEIGHT
 
     def __post_init__(self) -> None:
         for i in range(NUM_NODES):
@@ -190,14 +206,12 @@ def spawn_child_graph(g: Graph) -> Graph:
 
 
 def read_timestamp_sensor_vec() -> List[float]:
-    """Wall-clock features packed into VEC_DIM (Phase 5 real sensor)."""
+    """Wall-clock features: three phases repeated to 15 floats, padded to VEC_DIM (Phase 5)."""
     t = time.time()
-    a = t % 1000 / 1000.0
-    b = (t % 60) / 60.0
-    c = (t % 3600) / 3600.0
-    base = [a, b, c]
-    out = (base * 6)[:VEC_DIM]
-    return out
+    triple = [(t % 1000) / 1000.0, (t % 60) / 60.0, (t % 3600) / 3600.0]
+    fifteen = (triple * 5)[:15]
+    pad = fifteen + [fifteen[-1]]
+    return pad[:VEC_DIM]
 
 
 def read_external_event_vec(path: Path = EXTERNAL_EVENT_PATH) -> List[float]:
@@ -796,6 +810,13 @@ class ControlSystem:
         self.vibe_rollbacks = 0
         self.code_emit_commits = 0
         self.code_emit_rollbacks = 0
+        self.emergent_goal_commits = 0
+        self.emergent_goal_rollbacks = 0
+        # Phase 5: real sensor callables (wall clock + external file); blend in sense_real_world.
+        self.real_sensors: Tuple[Callable[[], List[float]], ...] = (
+            read_timestamp_sensor_vec,
+            read_external_event_vec,
+        )
 
     def control_path(self) -> Path:
         return self.env_paths[self.env_id]
@@ -895,11 +916,22 @@ class ControlSystem:
         t_mean, t_var = mean_var(combined)
         return b_mean, b_var, t_mean, t_var
 
-    def _blend_real_sensor(self, g: Graph) -> None:
-        """Blend wall-clock or file-backed signal into the sensor node (Phase 5)."""
-        raw = read_timestamp_sensor_vec() if self.rng.random() < 0.5 else read_external_event_vec()
+    def sense_real_world(self, g: Graph) -> List[float]:
+        """
+        After encode+inject, blend the sensor node with one random real sensor.
+        state[i] = state[i] * (1 - w) + sensor[i] * w, w = g.sensor_blend_weight.
+        """
+        w = min(1.0, max(0.0, g.sensor_blend_weight))
+        sensor_fn = self.rng.choice(self.real_sensors)
+        raw = sensor_fn()
+        out: List[float] = []
         for i in range(VEC_DIM):
-            g.nodes[SENSOR_ID].vector[i] = 0.5 * g.nodes[SENSOR_ID].vector[i] + 0.5 * raw[i]
+            s = raw[i] if i < len(raw) else 0.0
+            v = g.nodes[SENSOR_ID].vector[i]
+            nv = v * (1.0 - w) + s * w
+            g.nodes[SENSOR_ID].vector[i] = nv
+            out.append(nv)
+        return out
 
     def code_emission_proposal(self) -> Tuple[str, str]:
         """Small auditable one-line mutations (exec'd with restricted globals)."""
@@ -1042,6 +1074,133 @@ class ControlSystem:
             if not self.quiet:
                 print("CODE EMISSION: human veto or declined")
 
+    def tension_is_too_stable(self) -> bool:
+        """True when recent real-wave tension has been low-mean, low-var for long enough."""
+        h = self.graph.tension_history
+        n = min(EMERGENT_STABLE_WINDOW, len(h))
+        if n < 50:
+            return False
+        recent = h[-n:]
+        mean_t = sum(recent) / len(recent)
+        var_t = sum((x - mean_t) ** 2 for x in recent) / len(recent)
+        return mean_t < EMERGENT_STABLE_MEAN_MAX and var_t < EMERGENT_STABLE_VAR_MAX
+
+    def invent_new_goal(self) -> Tuple[str, str]:
+        """Small nudges toward plant state + tiny multipliers (large jumps blow up internal_wave tension)."""
+        g = self.graph
+        current = float(g.target)
+        plant = read_control_value(self.control_path())
+        nudge = current + (plant - current) * 0.08
+        opts: List[Tuple[str, str]] = [
+            ("nudge_toward_plant", f"self.target = {nudge:.6f}"),
+            ("micro_bump", f"self.target = {current * 1.001:.6f}"),
+            ("micro_trim", f"self.target = {current * 0.999:.6f}"),
+            ("incremental_bump", f"self.target = {current * 1.02:.6f}"),
+            ("incremental_trim", f"self.target = {current * 0.98:.6f}"),
+            (
+                "compound_cycle",
+                f"self.target = {current * 1.03:.6f}; (len(self.symbols) < {MAX_SYMBOLS}) and self.symbols.append(Symbol(pattern=[0, 0, 0, 0, 0], usage_count=0, tension_reduction=0.0))",
+            ),
+        ]
+        return self.rng.choice(opts)
+
+    def sandbox_emergent_eval(self, diff_line: str) -> Tuple[float, float, float, float]:
+        """Same contract as code emission: internal_wave baseline vs trial after exec on shadow graph."""
+        g = self.graph
+        v = read_control_value(self.control_path())
+        snap = graph_to_sim_state(g, v, self.encoder)
+        baseline = internal_wave(snap, VIBE_HORIZON)
+        b_mean, b_var = mean_var(baseline)
+        shadow = copy.deepcopy(g)
+        try:
+            exec(diff_line, {"self": shadow, "Symbol": Symbol, "math": math}, {})
+        except Exception:
+            return b_mean, b_var, 999999.0, 999999.0
+        snap2 = graph_to_sim_state(shadow, v, self.encoder)
+        trial = internal_wave(snap2, VIBE_HORIZON)
+        t_mean, t_var = mean_var(trial)
+        return b_mean, b_var, t_mean, t_var
+
+    def maybe_invent_goal(self) -> None:
+        """When tension has been 'too calm', propose a refined goal; internal-wave sandbox + ratio gate."""
+        if not self.tension_is_too_stable():
+            return
+        name, diff_line = self.invent_new_goal()
+        b_mean, b_var, t_mean, t_var = self.sandbox_emergent_eval(diff_line)
+        ts = time.time()
+        if emergent_relax_gate():
+            # Slightly looser than production ratio; still requires trial not to explode vs baseline.
+            gate_ok = t_mean < b_mean * 1.01 and t_var < b_var * 1.05
+        else:
+            gate_ok = t_mean < b_mean * EMERGENT_GATE_MEAN_RATIO and t_var < b_var * EMERGENT_GATE_VAR_RATIO
+        auto_yes = os.environ.get("CODE_EMISSION_AUTO", "").strip().lower() in (
+            "1",
+            "y",
+            "yes",
+        )
+
+        def audit(msg: str) -> None:
+            with open(VIBE_AUDIT_LOG, "a", encoding="utf-8") as log:
+                log.write(msg)
+
+        audit(
+            f"{ts:.0f} | ENV={self.env_id} | EMERGENT_GOAL_PROPOSAL {name} | diff={diff_line!r} | "
+            f"baseline_mean={b_mean:.6f} baseline_var={b_var:.6f} | "
+            f"sandbox_mean={t_mean:.6f} sandbox_var={t_var:.6f} | "
+            f"emergent_relax={emergent_relax_gate()} emergent_gate_mean<{EMERGENT_GATE_MEAN_RATIO} "
+            f"emergent_gate_var<{EMERGENT_GATE_VAR_RATIO} | gate_ok={gate_ok}\n"
+        )
+
+        if not gate_ok:
+            self.emergent_goal_rollbacks += 1
+            audit(f"{ts:.0f} | ENV={self.env_id} | EMERGENT_GOAL_ROLLBACK {name} (sandbox gate)\n")
+            if not self.quiet:
+                print(f"EMERGENT GOAL rolled back (sandbox): {name}")
+            return
+
+        if not self.quiet:
+            print("")
+            print("=== EMERGENT GOAL PROPOSAL ===")
+            print(f"PROPOSAL: {name}")
+            print(f"DIFF:     {diff_line}")
+            print(f"SANDBOX:  mean={t_mean:.6f} var={t_var:.6f}")
+            print(f"BASELINE: mean={b_mean:.6f} var={b_var:.6f}")
+
+        commit = False
+        if auto_yes:
+            commit = True
+            audit(f"{time.time():.0f} | ENV={self.env_id} | EMERGENT_GOAL_COMMIT {name} (CODE_EMISSION_AUTO)\n")
+        elif sys.stdin.isatty() and not self.quiet:
+            try:
+                answer = input("COMMIT new goal? (y/n): ").strip().lower()
+                commit = answer == "y"
+            except EOFError:
+                commit = False
+        else:
+            audit(
+                f"{time.time():.0f} | ENV={self.env_id} | EMERGENT_GOAL_HUMAN_VETO {name}\n"
+            )
+
+        if commit:
+            try:
+                exec(diff_line, {"self": self.graph, "Symbol": Symbol, "math": math}, {})
+            except Exception:
+                self.emergent_goal_rollbacks += 1
+                audit(f"{time.time():.0f} | ENV={self.env_id} | EMERGENT_GOAL_ROLLBACK {name} (exec failed)\n")
+                if not self.quiet:
+                    print(f"EMERGENT GOAL rolled back (live exec failed): {name}")
+                return
+            write_target(self.target_path, self.graph.target)
+            self.emergent_goal_commits += 1
+            audit(f"{time.time():.0f} | ENV={self.env_id} | EMERGENT_GOAL_COMMITTED {name} target={self.graph.target}\n")
+            if not self.quiet:
+                print(f"EMERGENT GOAL COMMITTED: {name} target={self.graph.target}")
+        else:
+            self.emergent_goal_rollbacks += 1
+            audit(f"{time.time():.0f} | ENV={self.env_id} | EMERGENT_GOAL_ROLLBACK {name} (veto or declined)\n")
+            if not self.quiet:
+                print("EMERGENT GOAL: veto or declined")
+
     def reinforce_edges(self, g: Graph, obj: float) -> None:
         delta = obj - self.baseline_objective
         self.baseline_objective = (1.0 - BASELINE_ALPHA) * self.baseline_objective + BASELINE_ALPHA * obj
@@ -1173,7 +1332,7 @@ class ControlSystem:
         sensor_vec = self.encoder.encode(value, g.target)
         inject_sensor(g, sensor_vec)
         if self.wave_num % REAL_SENSOR_INTERVAL == 0:
-            self._blend_real_sensor(g)
+            self.sense_real_world(g)
 
         # 4) Propagate + 5) Relax / normalise
         relax_and_normalize(g)
@@ -1257,6 +1416,8 @@ class ControlSystem:
             self.maybe_vibe_code()
         if self.wave_num > 0 and self.wave_num % code_emission_interval_waves() == 0:
             self.maybe_emit_code()
+        if self.wave_num > 0 and self.wave_num % EMERGENT_GOAL_INTERVAL == 0:
+            self.maybe_invent_goal()
 
         error_to_target = abs(new_value - g.target)
         if not self.quiet:
@@ -1265,7 +1426,8 @@ class ControlSystem:
                 f"error_to_target={error_to_target:.4f} pred_err_avg={g.prediction_error_avg:.4f} "
                 f"drift={drift_val:.4f} env={self.env_id} symbol_count={len(g.symbols)} commits={self.commits} rollbacks={self.rollbacks} "
                 f"vibe_c={self.vibe_commits} vibe_r={self.vibe_rollbacks} "
-                f"emit_c={self.code_emit_commits} emit_r={self.code_emit_rollbacks}"
+                f"emit_c={self.code_emit_commits} emit_r={self.code_emit_rollbacks} "
+                f"emerg_c={self.emergent_goal_commits} emerg_r={self.emergent_goal_rollbacks}"
             )
 
 
@@ -1328,6 +1490,7 @@ def run_scaling_test(
         episode_start = sys.wave_num
         v0_c, v0_r = sys.vibe_commits, sys.vibe_rollbacks
         e0_c, e0_r = sys.code_emit_commits, sys.code_emit_rollbacks
+        ag0_c, ag0_r = sys.emergent_goal_commits, sys.emergent_goal_rollbacks
         converge_wave: Optional[float] = None
         for _ in range(waves_per_env):
             sys.wave_step()
@@ -1348,6 +1511,8 @@ def run_scaling_test(
                 "vibe_rollbacks": sys.vibe_rollbacks - v0_r,
                 "code_emit_commits": sys.code_emit_commits - e0_c,
                 "code_emit_rollbacks": sys.code_emit_rollbacks - e0_r,
+                "emergent_commits": sys.emergent_goal_commits - ag0_c,
+                "emergent_rollbacks": sys.emergent_goal_rollbacks - ag0_r,
                 "final_tension": final_tension,
             }
         )
@@ -1360,10 +1525,23 @@ def run_scaling_test(
             f"ENV{r['env_id']} | waves_to_target~{r['converge_wave']:.0f} | pred_err_avg={r['pred_err_avg']:.6e} "
             f"| symbols={r['symbol_count']} | vibe_c={r['vibe_commits']} vibe_r={r['vibe_rollbacks']} "
             f"| emit_c={r['code_emit_commits']} emit_r={r['code_emit_rollbacks']} "
+            f"| emerg_c={r['emergent_commits']} emerg_r={r['emergent_rollbacks']} "
             f"| final_tension={r['final_tension']:.4f}"
         )
     return results
 
+
+# -----------------------------------------------------------------------------
+# Phase 5 FULL (implemented on ControlSystem + Graph, not as Graph.wave stubs):
+# - Graph.sensor_blend_weight (default 0.3), Graph.distributed_graphs
+# - real_sensors: read_timestamp_sensor_vec, read_external_event_vec
+# - sense_real_world() every REAL_SENSOR_INTERVAL waves after inject_sensor
+# - Distributed spawn via spawn_child_graph + DISTRIBUTED_SPAWN_DIFF; eval in
+#   sandbox_distributed_emission_eval (internal_wave / SimState, no invalid edges)
+# - maybe_emit_code: DISTRIBUTED_EMISSION_PROB (35%) vs standard exec proposals
+# - Emergent goals: maybe_invent_goal every EMERGENT_GOAL_INTERVAL waves if
+#   tension_is_too_stable (low mean/var over recent history); sandbox + audit
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     run_scaling_test(1000, 500.0, 50.0, 42)
